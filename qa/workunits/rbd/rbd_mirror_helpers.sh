@@ -21,6 +21,8 @@
 #  RBD_MIRROR_INSTANCES  - number of daemons to start per cluster
 #  RBD_MIRROR_CONFIG_KEY - if not empty, use config-key for remote cluster
 #                          secrets
+#  RBD_MIRROR_SHOW_FAILURE if not empty, more information on test failures will be
+#                          printed and the script will exit on fatal test failures
 # The cleanup can be done as a separate step, running the script with
 # `cleanup ${RBD_MIRROR_TEMDIR}' arguments.
 #
@@ -200,6 +202,33 @@ expect_failure()
 mkfname()
 {
     echo "$@" | sed -e 's|[/ ]|_|g'
+}
+
+print_stacktrace() {
+    local frame=1 LINE SUB FILE
+    while read LINE SUB FILE < <(caller "$frame"); do
+      printf '[%s]  %s @ %s:%s\n' "$((frame++))" "${SUB}" "${FILE}" "${LINE}"
+    done
+}
+
+fail() {
+    local fatal=$1
+    local frame=0 LINE SUB FILE
+
+    if [ -z "${RBD_MIRROR_SHOW_FAILURE}" ]; then
+        return 0
+    fi
+    
+    if [ -n "${fatal}" ]; then
+        echo "${fatal}"
+        print_stacktrace
+        exit 1
+    fi
+ 
+    read LINE SUB FILE < <(caller "$frame")
+    printf 'Non-fatal failure at: %s:%s %s()\n' "${FILE}" "${LINE}" "${SUB}" 
+
+    return 0
 }
 
 create_users()
@@ -950,6 +979,25 @@ create_image()
         --image-feature "${RBD_IMAGE_FEATURES}" $@ ${pool}/${image}
 }
 
+create_images()
+{
+  local cluster=$1 ; shift
+  local pool=$1 ; shift
+  local image_prefix=$1 ; shift
+  local count=$1 ; shift
+  local size=128
+
+  if [ -n "$1" ]; then
+    size=$1
+    shift
+  fi
+
+  local loop_instance
+  for loop_instance in `seq 0 $((count-1))`; do
+    create_image ${cluster} ${pool} ${image_prefix}${loop_instance} $size || return 1
+  done
+}
+
 is_pool_mirror_mode_image()
 {
     local pool=$1
@@ -1045,6 +1093,19 @@ remove_image_retry()
         remove_image ${cluster} ${pool} ${image} && return 0
     done
     return 1
+}
+
+remove_images_retry()
+{
+  local cluster=$1 ; shift
+  local pool=$1 ; shift
+  local image_prefix=$1 ; shift
+  local count=$1 ; shift
+
+  local loop_instance
+  for loop_instance in `seq 0 $((count-1))`; do
+    remove_image_retry ${cluster} ${pool} ${image_prefix}${loop_instance} || return 1
+  done
 }
 
 trash_move() {
@@ -1587,6 +1648,21 @@ group_add_image()
         group image add ${pool}/${group} ${image_pool}/${image}
 }
 
+group_add_images()
+{
+    local cluster=$1
+    local pool=$2
+    local group=$3
+    local image_pool=$4
+    local image_prefix=$5
+    local count=$6
+
+    local loop_instance
+    for loop_instance in `seq 0 $((count-1))`; do
+      group_add_image ${cluster} ${pool} ${group} ${image_pool} ${image_prefix}${loop_instance} || return 1
+    done
+}
+
 group_remove_image()
 {
     local cluster=$1
@@ -1597,6 +1673,21 @@ group_remove_image()
 
     rbd --cluster ${cluster} \
         group image remove ${pool}/${group} ${image_pool}/${image}
+}
+
+group_remove_images()
+{
+    local cluster=$1
+    local pool=$2
+    local group=$3
+    local image_pool=$4
+    local image_prefix=$5
+    local count=$6
+
+    local loop_instance
+    for loop_instance in `seq 0 $((count-1))`; do
+      group_remove_image ${cluster} ${pool} ${group} ${image_pool} ${image_prefix}${loop_instance} || return 1
+    done
 }
 
 enable_group_mirror()
@@ -1673,7 +1764,7 @@ test_group_present()
     local group=$3
     local test_state=$4
     local test_image_count=$5
-    local current_state=deleted
+    local current_state=not_present
     local current_image_count
 
     rbd --cluster ${cluster} group list ${pool} | grep "^${group}$" &&
@@ -1686,7 +1777,7 @@ test_group_present()
     test "${test_image_count}" = "${current_image_count}"
 }
 
-wait_for_group_present()
+wait_for_test_group_present()
 {
     local cluster=$1
     local pool=$2
@@ -1704,6 +1795,25 @@ wait_for_group_present()
     return 1
 }
 
+wait_for_group_present()
+{
+    local cluster=$1
+    local pool=$2
+    local group=$3
+    local image_count=$4
+
+    wait_for_test_group_present "${cluster}" "${pool}" "${group}" present "${image_count}"
+}
+
+wait_for_group_not_present()
+{
+    local cluster=$1
+    local pool=$2
+    local group=$3
+
+    wait_for_test_group_present "${cluster}" "${pool}" "${group}" not_present 0
+}
+
 test_group_replay_state()
 {
     local cluster=$1
@@ -1713,14 +1823,22 @@ test_group_replay_state()
     local image_count=$5
     local status_result
     local current_state=stopped
+    local actual_image_count
+    local started_image_count
 
-    status_result=$(admin_daemons "${cluster}" rbd mirror group status ${pool}/${group} | grep -i 'state') || return 1
-    echo "${status_result}" | grep -i 'Replaying' && current_state=started
-    test "${test_state}" = "${current_state}" || return 1
+    # Query the state from the rbd-mirror daemon directly
+    status_result=$(admin_daemons "${cluster}" rbd mirror group status ${pool}/${group} --format xml) || { fail; return 1; }
+    test "Replaying" = $($XMLSTARLET sel -t -v "//group_replayer/state" <<< "$status_result" ) && current_state=started
+    # from GroupReplayer.h, valid states are Starting, Replaying, Stopping, Stopped
+    test "${test_state}" = "${current_state}" || { fail; return 1; }
+    if [ -n "${image_count}" ]; then
+      actual_image_count=$($XMLSTARLET sel -t -v "count(//image_replayer/state)"  <<< "$status_result")
+      started_image_count=$($XMLSTARLET sel -t -v "count(//image_replayer[state='Replaying'])"  <<< "$status_result")
 
-    test -n "${image_count}" || return 0
-
-    # TODO: test images when group image status is returned by the rbd-mirror
+      test "${image_count}" = "${actual_image_count}" ||  { fail; return 1; }
+      # If the group is started then check that all images are started too
+      test "${test_state}" = "started" && { test "${image_count}" = "${started_image_count}" ||  { fail; return 1; } }
+    fi
 }
 
 wait_for_group_replay_state()
@@ -1739,6 +1857,7 @@ wait_for_group_replay_state()
                                 "${image_count}" &&
             return 0
     done
+    fail "Failed to reach expected state"
     return 1
 }
 
@@ -1766,7 +1885,7 @@ get_newest_group_mirror_snapshot()
 {
     local cluster=$1
     local pool=$2
-    local image=$3
+    local group=$3
     local log=$4
 
     rbd --cluster "${cluster}" group snap list "${pool}/${group}" --format xml | \
@@ -1823,21 +1942,27 @@ test_group_status_in_pool_dir()
     local pool=$2
     local group=$3
     local state_pattern="$4"
-    local description_pattern="$5"
-    local service_pattern="$6"
+    local image_count="$5"
+    local description_pattern="$6"
 
     local status_log=${TEMPDIR}/$(mkfname ${cluster}-${pool}-${group}.mirror_status)
-    CEPH_ARGS='' rbd --cluster ${cluster} mirror group status ${pool}/${group} |
-        tee ${status_log} >&2
-    grep "^  state: .*${state_pattern}" ${status_log} || return 1
-    grep "^  description: .*${description_pattern}" ${status_log} || return 1
+    CEPH_ARGS='' rbd --cluster ${cluster} mirror group status ${pool}/${group} --format xml --pretty-format > ${status_log} 
+    
+    test -n "${state_pattern}" && { test "${state_pattern}" = $($XMLSTARLET sel -t -v "//group/state" "${status_log}" ) || { fail; return 1; } }
+    test -n "${description_pattern}" && { test "${description_pattern}" = $($XMLSTARLET sel -t -v "//group/description" "${status_log}" ) || { fail; return 1; } }
 
-    if [ -n "${service_pattern}" ]; then
-        grep "service: *${service_pattern}" ${status_log} || return 1
-    elif echo ${state_pattern} | grep '^up+'; then
-        grep "service: *${MIRROR_USER_ID_PREFIX}.* on " ${status_log} || return 1
+    if echo ${state_pattern} | grep '^up+' >/dev/null; then
+        $XMLSTARLET sel -Q -t -v "//group/daemon_service/daemon_id[contains(text(), ${MIRROR_USER_ID_PREFIX})]" "${status_log}" || { fail; return 1; }
     else
-        grep "service: " ${status_log} && return 1
+        $XMLSTARLET sel -Q -t -v "//group/daemon_service/daemon_id" "${status_log}" && { fail; return 1; }
+    fi
+    
+    if [ -n "${image_count}" ]; then 
+        actual_image_count=$($XMLSTARLET sel -t -v "count(//images/image/status)" "$status_log")
+        started_image_count=$($XMLSTARLET sel -t -v "count(//images/image/status[contains(text(), 'replaying')])" "$status_log")
+
+        test "${image_count}" = "${actual_image_count}" || { fail; return 1; }
+        test "${image_count}" = "${started_image_count}"  || { fail; return 1; }
     fi
 
     return 0
@@ -1849,15 +1974,16 @@ wait_for_group_status_in_pool_dir()
     local pool=$2
     local group=$3
     local state_pattern="$4"
-    local description_pattern="$5"
-    local service_pattern="$6"
+    local image_count="$5"
+    local description_pattern="$6"
 
     for s in 1 2 4 8 8 8 8 8 8 8 8 16 16; do
         sleep ${s}
         test_group_status_in_pool_dir ${cluster} ${pool} ${group} \
-            "${state_pattern}" "${description_pattern}" "${service_pattern}" &&
+            "${state_pattern}" "${image_count}" "${description_pattern}" &&
             return 0
     done
+    fail 1 "failed to reach expected status"
     return 1
 }
 

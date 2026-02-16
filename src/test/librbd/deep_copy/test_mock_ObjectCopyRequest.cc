@@ -89,6 +89,7 @@ using ::testing::InSequence;
 using ::testing::Invoke;
 using ::testing::Return;
 using ::testing::ReturnNew;
+using ::testing::SetArgPointee;
 using ::testing::WithArg;
 
 namespace {
@@ -1099,6 +1100,152 @@ TEST_F(TestMockDeepCopyObjectCopyRequest, SkipSnapList) {
                            m_dst_snap_ids[1],
                            is_fast_diff(mock_dst_image_ctx) ?
                              OBJECT_EXISTS_CLEAN : OBJECT_EXISTS, 0);
+
+  request->send();
+  ASSERT_EQ(0, ctx.wait());
+}
+
+// Tracker #73831: deep-copy with FLATTEN of a clone whose parent is empty
+// writes explicit zeros for sparse-read holes, making the target fully
+// allocated instead of sparse.
+//
+// The read must be mocked because the test stub (TestMemIoCtxImpl) zero-pads
+// objects in memory -- reads return full buffers, never sparse results. In
+// production RADOS only returns extents that contain data.
+TEST_F(TestMockDeepCopyObjectCopyRequest, CloneOfEmptyParentFlatten) {
+  // empty parent -- no data in any object
+  librbd::RBD rbd;
+  std::string parent_name = get_temp_image_name();
+  int order = m_src_image_ctx->order;
+  ASSERT_EQ(0, create_image_full_pp(rbd, m_ioctx, parent_name,
+                                    m_image_size, RBD_FEATURE_LAYERING,
+                                    false, &order));
+  librbd::ImageCtx *parent_ictx;
+  ASSERT_EQ(0, open_image(parent_name, &parent_ictx));
+  ASSERT_EQ(0, TestFixture::snap_create(*parent_ictx, "snap"));
+  ASSERT_EQ(0, TestFixture::snap_protect(*parent_ictx, "snap"));
+
+  // clone the empty parent
+  std::string clone_name = get_temp_image_name();
+  ASSERT_EQ(0, librbd::clone(m_ioctx, parent_name.c_str(), "snap",
+                             m_ioctx, clone_name.c_str(),
+                             RBD_FEATURE_LAYERING, &order, 0, 0));
+  librbd::ImageCtx *clone_ictx;
+  ASSERT_EQ(0, open_image(clone_name, &clone_ictx));
+
+  // write at offset > 0 so that [0, write_offset) is a sparse hole --
+  // the bug turns this hole into an explicit zero op on the destination
+  uint64_t write_offset = 1024;
+  uint64_t write_length = 512;
+  bufferlist write_bl;
+  write_bl.append(std::string(write_length, 'A'));
+  ASSERT_EQ(static_cast<int>(write_length),
+            api::Io<>::write(*clone_ictx, write_offset, write_length,
+                             bufferlist{write_bl}, 0));
+
+  // snapshot bookkeeping: src snap → dst snap mapping
+  librados::snap_t clone_snap_id;
+  ASSERT_EQ(0, create_snap(clone_ictx, "copy", &clone_snap_id));
+  librados::snap_t dst_snap_id;
+  ASSERT_EQ(0, create_snap(m_dst_image_ctx, "copy", &dst_snap_id));
+  m_snap_map[clone_snap_id] = {dst_snap_id};
+  m_snap_seqs[clone_snap_id] = dst_snap_id;
+  m_src_snap_ids.push_back(clone_snap_id);
+  m_dst_snap_ids.push_back(dst_snap_id);
+
+  librbd::MockTestImageCtx mock_src_image_ctx(*clone_ictx);
+  librbd::MockTestImageCtx mock_dst_image_ctx(*m_dst_image_ctx);
+
+  // src.parent != nullptr → compute_zero_ops enters with hide_parent=true
+  librbd::MockTestImageCtx mock_parent_image_ctx(*parent_ictx);
+  mock_src_image_ctx.parent = &mock_parent_image_ctx;
+
+  librbd::MockExclusiveLock mock_exclusive_lock;
+  prepare_exclusive_lock(mock_dst_image_ctx, mock_exclusive_lock);
+
+  librbd::MockObjectMap mock_object_map;
+  mock_dst_image_ctx.object_map = &mock_object_map;
+
+  expect_op_work_queue(mock_src_image_ctx);
+  expect_test_features(mock_dst_image_ctx);
+  expect_get_object_count(mock_dst_image_ctx);
+
+  // dst parent overlap = 0 (empty parent) → hide_parent becomes false
+  // before the zero interval loop -- this is the condition that exposes
+  // the bug: zeros should be skipped but weren't
+  EXPECT_CALL(mock_dst_image_ctx, get_parent_overlap(_, _))
+    .WillRepeatedly(DoAll(SetArgPointee<1>(0), Return(0)));
+  EXPECT_CALL(mock_src_image_ctx, get_parent_overlap(_, _))
+    .WillRepeatedly(Invoke([clone_ictx](librados::snap_t snap_id,
+                                        uint64_t *overlap) {
+        return clone_ictx->get_parent_overlap(snap_id, overlap);
+    }));
+  EXPECT_CALL(mock_src_image_ctx, prune_parent_extents(_, _, _, _))
+    .WillRepeatedly(Invoke([clone_ictx](
+        io::Extents& extents, io::ImageArea area,
+        uint64_t overlap, bool truncate) -> uint64_t {
+        return clone_ictx->prune_parent_extents(
+          extents, area, overlap, truncate);
+    }));
+
+  C_SaferCond ctx;
+  MockObjectCopyRequest *request = create_request(
+    mock_src_image_ctx, mock_dst_image_ctx,
+    0, CEPH_NOSNAP, 0,
+    OBJECT_COPY_REQUEST_FLAG_FLATTEN, &ctx);
+
+  librados::MockTestMemIoCtxImpl &mock_dst_io_ctx(get_mock_io_ctx(
+    request->get_dst_io_ctx()));
+
+  // ** thick-zero assertion ** -- the empty parent has no data to hide, so
+  // the sparse hole must NOT be written as an explicit zero on the dst.
+  // Without the fix, compute_zero_ops emits zero(0, write_offset).
+  EXPECT_CALL(mock_dst_io_ctx, zero(_, _, _, _)).Times(0);
+  EXPECT_CALL(mock_dst_io_ctx, create(_, _, _)).Times(0);
+
+  InSequence seq;
+
+  // list_snaps: real dispatch — populates snapshot_delta from the clone
+  expect_list_snaps(mock_src_image_ctx, 0);
+
+  // read: mocked to return sparse result — data at [write_offset, len),
+  // hole at [0, write_offset). merge_write_ops puts the hole into
+  // zero_interval; without the fix compute_zero_ops writes it as a zero op.
+  uint64_t data_range = write_offset + write_length;
+  interval_set<uint64_t> read_extents;
+  read_extents.insert(0, data_range);
+  EXPECT_CALL(*mock_src_image_ctx.io_image_dispatcher,
+              send(IsRead(clone_snap_id, read_extents)))
+    .WillOnce(Invoke([write_offset, write_length, data_range, &write_bl]
+                     (io::ImageDispatchSpec* spec) {
+        // wire up ReadResult the way the real dispatch pipeline does
+        auto& read_req = std::get<io::ImageDispatchSpec::Read>(spec->request);
+        spec->aio_comp->read_result = std::move(read_req.read_result);
+        spec->aio_comp->read_result.set_image_extents(spec->image_extents);
+        spec->aio_comp->set_request_count(1);
+
+        // must precede complete() — mark_complete_and_notify checks it
+        spec->dispatch_result = io::DISPATCH_RESULT_COMPLETE;
+
+        // sparse result: data at [write_offset, write_length), hole before it
+        io::ReadExtents obj_extents;
+        obj_extents.emplace_back(
+            0, data_range,
+            striper::LightweightBufferExtents{{0, data_range}},
+            bufferlist{write_bl},
+            io::Extents{{write_offset, write_length}});
+        auto c = new io::ReadResult::C_ObjectReadRequest(
+            spec->aio_comp, std::move(obj_extents));
+        c->complete(0);  // triggers full completion chain; spec is deleted
+    }));
+
+  expect_start_op(mock_exclusive_lock);
+  expect_update_object_map(mock_dst_image_ctx, mock_object_map,
+                           dst_snap_id, OBJECT_EXISTS, 0);
+  expect_prepare_copyup(mock_dst_image_ctx);
+  expect_start_op(mock_exclusive_lock);
+  // only the clone's actual data reaches the dst — no zero ops
+  expect_write(mock_dst_io_ctx, write_offset, write_length, {0, {}}, 0);
 
   request->send();
   ASSERT_EQ(0, ctx.wait());

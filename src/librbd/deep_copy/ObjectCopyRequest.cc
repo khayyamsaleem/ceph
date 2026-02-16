@@ -688,6 +688,27 @@ void ObjectCopyRequest<I>::compute_zero_ops() {
       }
     }
 
+    if (!hide_parent) {
+      // At this point zero_interval contains sparse-read holes from
+      // merge_write_ops: regions where list_snaps reported DATA but the
+      // actual read returned no data (OSD-level sparseness). These
+      // represent natural holes in the source object and must NOT become
+      // explicit zero writes on the destination -- doing so would
+      // allocate space that should remain sparse (tracker #73831).
+      //
+      // Clearing is safe because the delta scan below re-adds any ZEROED
+      // entries from m_snapshot_delta (truncation, discard, zero-fill).
+      // These represent actual state changes between snapshots and are
+      // always tracked by the OSD in list_snaps, independent of the
+      // sparse-read holes discarded here.
+      //
+      // When hide_parent is true, we keep the sparse-read holes: the
+      // destination needs explicit zeros to mask inherited parent data.
+      // hide_parent is only true when the source has a parent AND the
+      // destination's parent overlap is non-zero.
+      zero_interval.clear();
+    }
+
     // collect known zeroed extents from the snapshot delta for the current
     // src snapshot. If this is the first snapshot, we might need to handle
     // the whiteout case if it overlaps with the parent
